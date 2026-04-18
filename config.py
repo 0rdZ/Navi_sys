@@ -26,7 +26,7 @@ class MapConfig:
     """地图生成与显示配置"""
 
     # 地图节点数量
-    NODE_COUNT: int = 500
+    NODE_COUNT: int = 120
 
     # 二维平面坐标范围
     MAP_MIN_X: float = 0.0

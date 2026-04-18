@@ -1,20 +1,19 @@
 """
 map_generator.py
-随机地图生成模块。
+随机地图生成模块（优化版）。
 
-作用：
-1. 在二维平面内随机生成节点；
-2. 为每个节点连接若干附近节点，形成道路；
-3. 尽量避免不合理的道路相交；
-4. 保证生成图是连通图；
-5. 为每条边分配长度与容量等属性。
+优化点：
+1. 使用距离缓存，避免重复计算节点间距离；
+2. 为每个节点预生成最近邻候选列表，避免反复全量排序；
+3. 使用顺序连通构造，降低生成连通图的时间开销；
+4. 在线段相交检测前增加包围盒快速排除。
 """
 
 from __future__ import annotations
 
 import math
 import random
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from config import CONFIG
 from models import Edge, Graph, Node
@@ -27,6 +26,15 @@ class MapGenerator:
         self.random = random.Random(seed)
         self._base_edge_id = 0
 
+        # 距离缓存：(a, b) -> distance
+        self._distance_cache: Dict[Tuple[int, int], float] = {}
+
+        # 最近邻候选缓存：node_id -> [(other_id, distance), ...]
+        self._neighbor_cache: Dict[int, List[Tuple[int, float]]] = {}
+
+        # 每个节点保留的最近邻候选数量
+        self._candidate_limit = max(12, CONFIG.MAP.MAX_NEIGHBORS * 3)
+
     def generate_map(self) -> Graph:
         """生成一个满足基本要求的随机连通地图。"""
         graph = Graph()
@@ -35,10 +43,12 @@ class MapGenerator:
         for node in nodes:
             graph.add_node(node)
 
-        # 第一步：先构造一棵生成树，保证图连通
+        self._prepare_distance_and_neighbor_cache(graph)
+
+        # 第一步：先构造连通图骨架
         self._build_spanning_connections(graph)
 
-        # 第二步：再补充局部近邻连接，增强道路网络
+        # 第二步：补充局部近邻连接
         self._add_local_connections(graph)
 
         return graph
@@ -52,64 +62,118 @@ class MapGenerator:
             nodes.append(Node(node_id=node_id, x=x, y=y, name=f"P{node_id}"))
         return nodes
 
+    def _prepare_distance_and_neighbor_cache(self, graph: Graph) -> None:
+        """预计算距离缓存和每个节点的最近邻候选。"""
+        node_ids = list(graph.nodes.keys())
+
+        # 预计算距离
+        for i in range(len(node_ids)):
+            a = node_ids[i]
+            for j in range(i + 1, len(node_ids)):
+                b = node_ids[j]
+                self._distance(graph, a, b)
+
+        # 为每个节点构建最近邻候选列表
+        for node_id in node_ids:
+            candidates: List[Tuple[int, float]] = []
+            for other_id in node_ids:
+                if other_id == node_id:
+                    continue
+                candidates.append((other_id, self._distance(graph, node_id, other_id)))
+            candidates.sort(key=lambda item: item[1])
+            self._neighbor_cache[node_id] = candidates[: self._candidate_limit]
+
+    def _distance(self, graph: Graph, a: int, b: int) -> float:
+        """获取两节点间距离，带缓存。"""
+        if a == b:
+            return 0.0
+
+        key = (a, b)
+        if key in self._distance_cache:
+            return self._distance_cache[key]
+
+        na = graph.nodes[a]
+        nb = graph.nodes[b]
+        distance = math.hypot(na.x - nb.x, na.y - nb.y)
+
+        self._distance_cache[(a, b)] = distance
+        self._distance_cache[(b, a)] = distance
+        return distance
+
     def _build_spanning_connections(self, graph: Graph) -> None:
         """
-        利用“每次连接到最近已加入节点”的方式构造连通图。
-        这样不一定是最小生成树，但能较稳定地形成较自然的道路结构。
+        构造连通图骨架。
+        优化思路：
+        - 不再每轮在 remaining × connected 上做全局扫描；
+        - 对每个新节点，优先连接到“最近邻候选列表”中已连通的节点；
+        - 如果候选中都没有，再退化为扫描 connected。
         """
         node_ids = list(graph.nodes.keys())
         if not node_ids:
             return
 
-        connected: Set[int] = {node_ids[0]}
-        remaining: Set[int] = set(node_ids[1:])
+        first_node = node_ids[0]
+        connected: Set[int] = {first_node}
 
-        while remaining:
-            best_pair: Optional[Tuple[int, int, float]] = None
+        remaining = node_ids[1:]
+        self.random.shuffle(remaining)
 
-            for node_id in remaining:
-                node = graph.nodes[node_id]
-                nearest_connected = None
-                nearest_distance = float("inf")
+        for node_id in remaining:
+            target_id = self._find_best_connected_neighbor(graph, node_id, connected)
+            distance = self._distance(graph, node_id, target_id)
 
-                for connected_id in connected:
-                    other = graph.nodes[connected_id]
-                    distance = node.distance_to(other)
-                    if distance < nearest_distance:
-                        nearest_distance = distance
-                        nearest_connected = connected_id
-
-                if nearest_connected is not None:
-                    candidate = (node_id, nearest_connected, nearest_distance)
-                    if best_pair is None or candidate[2] < best_pair[2]:
-                        best_pair = candidate
-
-            if best_pair is None:
-                break
-
-            start_id, end_id, distance = best_pair
-            if self._can_add_undirected_edge(graph, start_id, end_id):
-                self._add_undirected_edge(graph, start_id, end_id, distance)
+            if self._can_add_undirected_edge(graph, node_id, target_id):
+                self._add_undirected_edge(graph, node_id, target_id, distance)
             else:
-                # 若最近边会相交，则尝试寻找其他已连接节点
+                # 候选中找替代节点
                 alternative_added = False
-                sorted_connected = sorted(
-                    connected,
-                    key=lambda cid: graph.nodes[start_id].distance_to(graph.nodes[cid]),
-                )
-                for alt_id in sorted_connected:
-                    alt_distance = graph.nodes[start_id].distance_to(graph.nodes[alt_id])
-                    if self._can_add_undirected_edge(graph, start_id, alt_id):
-                        self._add_undirected_edge(graph, start_id, alt_id, alt_distance)
+
+                for alt_id, alt_distance in self._neighbor_cache.get(node_id, []):
+                    if alt_id not in connected:
+                        continue
+                    if self._can_add_undirected_edge(graph, node_id, alt_id):
+                        self._add_undirected_edge(graph, node_id, alt_id, alt_distance)
                         alternative_added = True
                         break
 
                 if not alternative_added:
-                    # 极端情况下允许跳过相交检测，优先保证连通
-                    self._add_undirected_edge(graph, start_id, end_id, distance)
+                    # 最后兜底：扫描所有已连通点
+                    connected_sorted = sorted(
+                        connected,
+                        key=lambda cid: self._distance(graph, node_id, cid),
+                    )
+                    for alt_id in connected_sorted:
+                        alt_distance = self._distance(graph, node_id, alt_id)
+                        if self._can_add_undirected_edge(graph, node_id, alt_id):
+                            self._add_undirected_edge(graph, node_id, alt_id, alt_distance)
+                            alternative_added = True
+                            break
 
-            connected.add(start_id)
-            remaining.remove(start_id)
+                if not alternative_added:
+                    # 极端情况下忽略相交检测，优先保证连通
+                    self._add_undirected_edge(graph, node_id, target_id, distance)
+
+            connected.add(node_id)
+
+    def _find_best_connected_neighbor(self, graph: Graph, node_id: int, connected: Set[int]) -> int:
+        """在已连通节点中寻找最适合连接的节点。"""
+        for other_id, _ in self._neighbor_cache.get(node_id, []):
+            if other_id in connected:
+                return other_id
+
+        # 若局部候选中没有，就退化扫描 connected
+        best_id = None
+        best_distance = float("inf")
+        for other_id in connected:
+            d = self._distance(graph, node_id, other_id)
+            if d < best_distance:
+                best_distance = d
+                best_id = other_id
+
+        if best_id is None:
+            raise RuntimeError("无法为节点找到可连接的已连通节点。")
+
+        return best_id
 
     def _add_local_connections(self, graph: Graph) -> None:
         """为每个节点增加若干条近邻连接。"""
@@ -125,8 +189,7 @@ class MapGenerator:
             if len(current_neighbors) >= target_degree:
                 continue
 
-            candidates = self._sorted_neighbor_candidates(graph, node_id)
-            for other_id, distance in candidates:
+            for other_id, distance in self._neighbor_cache.get(node_id, []):
                 if other_id == node_id:
                     continue
                 if other_id in current_neighbors:
@@ -140,17 +203,6 @@ class MapGenerator:
 
                 self._add_undirected_edge(graph, node_id, other_id, distance)
                 current_neighbors.add(other_id)
-
-    def _sorted_neighbor_candidates(self, graph: Graph, node_id: int) -> List[Tuple[int, float]]:
-        """返回按距离从近到远排序的候选邻居。"""
-        base = graph.nodes[node_id]
-        candidates: List[Tuple[int, float]] = []
-        for other_id, other in graph.nodes.items():
-            if other_id == node_id:
-                continue
-            candidates.append((other_id, base.distance_to(other)))
-        candidates.sort(key=lambda item: item[1])
-        return candidates
 
     def _has_connection(self, graph: Graph, a: int, b: int) -> bool:
         """判断两个节点之间是否已经存在连接。"""
@@ -181,10 +233,11 @@ class MapGenerator:
     def _can_add_undirected_edge(self, graph: Graph, a: int, b: int) -> bool:
         """
         判断新增道路是否合理。
-        当前规则：
-        1. 不能重复连边；
-        2. 不与已有道路发生不合理相交；
-        3. 允许在共享端点处相交。
+        规则：
+        1. 不能自连；
+        2. 不能重复连边；
+        3. 不与已有道路发生不合理相交；
+        4. 允许在共享端点处相交。
         """
         if a == b:
             return False
@@ -195,30 +248,51 @@ class MapGenerator:
         new_b = graph.nodes[b]
 
         checked_pairs: Set[Tuple[int, int]] = set()
+
         for edge in graph.edges.values():
             u, v = edge.start, edge.end
+            key = tuple(sorted((u, v)))
 
             # 无向边只检查一次
-            key = tuple(sorted((u, v)))
             if key in checked_pairs:
                 continue
             checked_pairs.add(key)
 
+            # 共享端点，认为合理
             if len({a, b, u, v}) < 4:
-                # 共享端点，认为合理
                 continue
 
             old_a = graph.nodes[u]
             old_b = graph.nodes[v]
-            if self._segments_intersect(
-                (new_a.x, new_a.y),
-                (new_b.x, new_b.y),
-                (old_a.x, old_a.y),
-                (old_b.x, old_b.y),
-            ):
+
+            p1 = (new_a.x, new_a.y)
+            p2 = (new_b.x, new_b.y)
+            q1 = (old_a.x, old_a.y)
+            q2 = (old_b.x, old_b.y)
+
+            # 先做包围盒快速排除
+            if not self._bbox_overlap(p1, p2, q1, q2):
+                continue
+
+            if self._segments_intersect(p1, p2, q1, q2):
                 return False
 
         return True
+
+    @staticmethod
+    def _bbox_overlap(
+        p1: Tuple[float, float],
+        p2: Tuple[float, float],
+        q1: Tuple[float, float],
+        q2: Tuple[float, float],
+    ) -> bool:
+        """判断两线段的外接矩形是否重叠。"""
+        return not (
+            max(p1[0], p2[0]) < min(q1[0], q2[0])
+            or max(q1[0], q2[0]) < min(p1[0], p2[0])
+            or max(p1[1], p2[1]) < min(q1[1], q2[1])
+            or max(q1[1], q2[1]) < min(p1[1], p2[1])
+        )
 
     @staticmethod
     def _segments_intersect(
